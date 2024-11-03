@@ -13,13 +13,6 @@
 
 static struct block_meta *block_metadata, *last_block;
 
-void insert_new_block(struct block_meta *meta, size_t size, int status,
-                      struct block_meta *prev, struct block_meta *next) {
-  set_block_metadata(meta, size, status, prev, next);
-  last_block->next = meta;
-  last_block = meta;
-}
-
 void set_block_metadata(struct block_meta *meta, size_t size, int status,
                         struct block_meta *prev, struct block_meta *next) {
   meta->size = size;
@@ -28,12 +21,17 @@ void set_block_metadata(struct block_meta *meta, size_t size, int status,
   meta->next = next;
 }
 
+int syscall_fail(void *ptr, char *str) {
+  if (ptr == (void *)-1) {
+		DIE(ptr == (void *)-1, str);
+		return 1;
+	}
+  return 0;
+}
+
 void preallocate_heap() {
   void *heap = sbrk(MMAP_THRESHOLD);
-  if (heap == (void *)-1) {
-		DIE(heap == (void *)-1, "heap preallocation failed");
-		return NULL;
-	}
+  if (syscall_fail(heap, "heap preallocation fail")) return;
 
   block_metadata = (struct block_meta *)heap;
   set_block_metadata(block_metadata, MMAP_THRESHOLD - METADATA_SIZE, STATUS_FREE, NULL, NULL);
@@ -48,6 +46,23 @@ struct block_meta *find_best_available_space(struct block_meta *meta, size_t pay
     }
   }
   return best_block;
+}
+
+struct block_meta *append_new_block(size_t size, int status) {
+  void *ptr = sbrk(size + METADATA_SIZE);
+  if (syscall_fail(ptr, "new block space allocation failed")) return NULL;
+  struct block_meta *new_block = (struct block_meta *)ptr;
+  set_block_metadata(new_block, size, status, last_block, NULL);
+  last_block->next = new_block;
+  last_block = new_block;
+  return new_block;
+}
+
+struct block_meta *extend_last_block(size_t payload_size) {
+  void *ptr = sbrk(payload_size - last_block->size);
+  if (syscall_fail(ptr, "extend last free block fail")) return NULL;
+  set_block_metadata(last_block, payload_size, STATUS_ALLOC, last_block->prev, NULL);
+  return last_block;
 }
 
 void *os_malloc(size_t size)
@@ -69,25 +84,17 @@ void *os_malloc(size_t size)
     if (new_block) {
       new_block->status = STATUS_ALLOC;
     } else {
-      void *ptr = sbrk(block_size);
-      if (ptr == (void *)-1) {
-		    DIE(ptr == (void *)-1, "heap preallocation failed");
-		    return NULL;
-	    }
-
-      new_block = (struct block_meta *)ptr;
-      insert_new_block(new_block, payload_size, STATUS_ALLOC, last_block, NULL);
+      if (last_block->status == STATUS_FREE) {
+        new_block = extend_last_block(payload_size);
+      } else {
+        new_block = append_new_block(payload_size, STATUS_ALLOC);
+      }
     }
     return (char *)new_block + METADATA_SIZE;
   }
 
   void *new_block = mmap(NULL, block_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-
-  if (new_block == MAP_FAILED) {
-    DIE(new_block == MAP_FAILED, "malloc mmap allocation failed");
-    return NULL;
-  }
-
+  if (syscall_fail(new_block, "new block space allocation fail")) return NULL;
   set_block_metadata((struct block_meta*)new_block, payload_size, STATUS_MAPPED, NULL, NULL);
   return (char *)new_block + METADATA_SIZE;
 }
