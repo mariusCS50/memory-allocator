@@ -10,6 +10,8 @@
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
 #define METADATA_SIZE	ALIGN((sizeof(struct block_meta)))
 #define MMAP_THRESHOLD (128 * 1024)
+#define PAYLOAD(block) ((char *)block + METADATA_SIZE)
+#define MIN(a, b) a < b ? a : b
 
 static struct block_meta *memory_block_metas, *last_block;
 
@@ -31,38 +33,49 @@ int syscall_fail(void *ptr, char *str) {
 
 void preallocate_heap() {
   void *heap = sbrk(MMAP_THRESHOLD);
-  if (syscall_fail(heap, "heap preallocation fail")) return;
+  if (syscall_fail(heap, "heap preallocation failed")) return;
 
   memory_block_metas = (struct block_meta *)heap;
   set_block_metadata(memory_block_metas, MMAP_THRESHOLD - METADATA_SIZE, STATUS_FREE, NULL, NULL);
   last_block = memory_block_metas;
 }
 
-struct block_meta *find_best_available_space(struct block_meta *block, size_t payload_size) {
+void coalesce_all_free_blocks(struct block_meta *block) {
+  while (block && block->next) {
+    if (block->status == STATUS_FREE && block->next->status == STATUS_FREE) {
+      last_block = (block->next == last_block ? block : last_block);
+      set_block_metadata(block, block->size + block->next->size + METADATA_SIZE, STATUS_FREE, block->prev, block->next->next);
+    } else {
+      block = block->next;
+    }
+  }
+}
+
+void *find_best_available_space(struct block_meta *block, size_t payload_size) {
   struct block_meta *best_block = NULL;
   for (; block != NULL; block = block->next) {
     if ((block->status == STATUS_FREE && block->size >= payload_size) && (best_block == NULL || block->size < best_block->size)) {
       best_block = block;
     }
   }
-  return best_block;
+  return (void *)best_block;
 }
 
-struct block_meta *append_new_block(size_t payload_size) {
+void *append_new_block(size_t payload_size) {
   void *ptr = sbrk(payload_size + METADATA_SIZE);
   if (syscall_fail(ptr, "new block space allocation failed")) return NULL;
   struct block_meta *new_block = (struct block_meta *)ptr;
   set_block_metadata(new_block, payload_size, STATUS_ALLOC, last_block, NULL);
   last_block->next = new_block;
   last_block = new_block;
-  return new_block;
+  return (void *)new_block;
 }
 
-struct block_meta *extend_last_block(size_t payload_size) {
+void *extend_last_block(size_t payload_size) {
   void *ptr = sbrk(payload_size - last_block->size);
-  if (syscall_fail(ptr, "extend last free block fail")) return NULL;
+  if (syscall_fail(ptr, "extend last free block failed")) return NULL;
   set_block_metadata(last_block, payload_size, STATUS_ALLOC, last_block->prev, NULL);
-  return last_block;
+  return (void *)last_block;
 }
 
 size_t check_block_for_splitting(struct block_meta *block, size_t payload_size) {
@@ -78,55 +91,39 @@ size_t check_block_for_splitting(struct block_meta *block, size_t payload_size) 
   return block->size;
 }
 
-void coalesce_free_blocks(struct block_meta *block) {
-  while (block && block->next) {
-    if (block->status == STATUS_FREE && block->next->status == STATUS_FREE) {
-      last_block = (block->next == last_block ? block : last_block);
-      set_block_metadata(block, block->size + block->next->size + METADATA_SIZE, STATUS_FREE, block->prev, block->next->next);
-    } else {
-      block = block->next;
-    }
-  }
-}
-
-void *os_malloc(size_t size)
-{
+void *os_malloc(size_t size) {
   if (size <= 0) {
     return NULL;
   }
 
   size_t payload_size = ALIGN(size);
-  size_t block_size = payload_size + METADATA_SIZE;
+  size_t block_size = payload_size + ALIGN(METADATA_SIZE);
+  void *new_block;
 
   if (block_size <= MMAP_THRESHOLD) {
     if (memory_block_metas == NULL) {
       preallocate_heap();
     }
 
-    coalesce_free_blocks(memory_block_metas);
-    struct block_meta *new_block = find_best_available_space(memory_block_metas, payload_size);
+    coalesce_all_free_blocks(memory_block_metas);
+    new_block = find_best_available_space(memory_block_metas, payload_size);
 
-    if (new_block) {
-      size_t new_size = check_block_for_splitting(new_block, payload_size);
-      set_block_metadata(new_block, new_size, STATUS_ALLOC, new_block->prev, new_block->next);
+    if (new_block == NULL) {
+      new_block = (last_block->status == STATUS_FREE ? extend_last_block(payload_size) : append_new_block(payload_size));
     } else {
-      if (last_block->status == STATUS_FREE) {
-        new_block = extend_last_block(payload_size);
-      } else {
-        new_block = append_new_block(payload_size);
-      }
+      struct block_meta *temp_block = (struct block_meta *)new_block;
+      size_t new_size = check_block_for_splitting(temp_block, payload_size);
+      set_block_metadata(temp_block, new_size, STATUS_ALLOC, temp_block->prev, temp_block->next);
     }
-    return (char *)new_block + METADATA_SIZE;
+  } else {
+    new_block = mmap(NULL, block_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (syscall_fail(new_block, "new block space allocation failed")) return NULL;
+    set_block_metadata((struct block_meta*)new_block, payload_size, STATUS_MAPPED, NULL, NULL);
   }
-
-  void *new_block = mmap(NULL, block_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-  if (syscall_fail(new_block, "new block space allocation fail")) return NULL;
-  set_block_metadata((struct block_meta*)new_block, payload_size, STATUS_MAPPED, NULL, NULL);
-  return (char *)new_block + METADATA_SIZE;
+  return PAYLOAD(new_block);
 }
 
-void os_free(void *ptr)
-{
+void os_free(void *ptr) {
   if (ptr == NULL) {
     return;
   }
@@ -135,50 +132,102 @@ void os_free(void *ptr)
     block->status = STATUS_FREE;
   }
   if (block->status == STATUS_MAPPED) {
-    munmap(block, block->size + METADATA_SIZE);
+    int call = munmap(block, block->size + METADATA_SIZE);
+    if (syscall_fail(call, "free memory block failed")) return NULL;
   }
 }
 
-void *os_calloc(size_t nmemb, size_t size)
-{
+void *os_calloc(size_t nmemb, size_t size) {
 	if (nmemb == 0 || size == 0) {
     return NULL;
   }
 
   size_t payload_size = ALIGN(nmemb * size);
-  size_t block_size = payload_size + METADATA_SIZE;
+  size_t block_size = payload_size + ALIGN(METADATA_SIZE);
+  void *new_block;
 
   if (block_size <= getpagesize()) {
     if (memory_block_metas == NULL) {
       preallocate_heap();
     }
 
-    coalesce_free_blocks(memory_block_metas);
-    struct block_meta *new_block = find_best_available_space(memory_block_metas, payload_size);
+    coalesce_all_free_blocks(memory_block_metas);
+    new_block = find_best_available_space(memory_block_metas, payload_size);
 
-    if (new_block) {
-      size_t new_size = check_block_for_splitting(new_block, payload_size);
-      set_block_metadata(new_block, new_size, STATUS_ALLOC, new_block->prev, new_block->next);
+    if (new_block == NULL) {
+      new_block = (last_block->status == STATUS_FREE ? extend_last_block(payload_size) : append_new_block(payload_size));
     } else {
-      if (last_block->status == STATUS_FREE) {
-        new_block = extend_last_block(payload_size);
-      } else {
-        new_block = append_new_block(payload_size);
-      }
+      struct block_meta *temp_block = (struct block_meta *)new_block;
+      size_t new_size = check_block_for_splitting(temp_block, payload_size);
+      set_block_metadata(temp_block, new_size, STATUS_ALLOC, temp_block->prev, temp_block->next);
     }
-    memset((char *)new_block + METADATA_SIZE, 0, payload_size);
-    return (char *)new_block + METADATA_SIZE;
+  } else {
+    new_block = mmap(NULL, block_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (syscall_fail(new_block, "new block space allocation failed")) return NULL;
+    set_block_metadata((struct block_meta*)new_block, payload_size, STATUS_MAPPED, NULL, NULL);
   }
+  memset(PAYLOAD(new_block), 0, payload_size);
+  return PAYLOAD(new_block);
+}
 
-  void *new_block = mmap(NULL, block_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-  if (syscall_fail(new_block, "new block space allocation fail")) return NULL;
-  set_block_metadata((struct block_meta*)new_block, payload_size, STATUS_MAPPED, NULL, NULL);
-  memset((char *)new_block + METADATA_SIZE, payload_size, 0);
-  return (char *)new_block + METADATA_SIZE;
+void coalesce_current_block(struct block_meta *curr, struct block_meta *foll, size_t new_payload_size) {
+  if (foll == NULL) {
+    return;
+  }
+  while (foll->status == STATUS_FREE && curr->size < new_payload_size) {
+    set_block_metadata(curr, curr->size + METADATA_SIZE + foll->size, STATUS_FREE, curr->prev, foll->next);
+  }
 }
 
 void *os_realloc(void *ptr, size_t size)
 {
-	/* TODO: Implement os_realloc */
-	return NULL;
+	if (ptr == NULL) {
+    return os_malloc(size);
+  }
+  if (size == 0) {
+    os_free(ptr);
+    return NULL;
+  }
+
+  struct block_meta *block = (struct block_meta *)((char *)ptr - METADATA_SIZE);
+  if (block->status == STATUS_FREE) {
+    return NULL;
+  }
+  size_t new_payload_size = ALIGN(size);
+  size_t new_block_size = new_payload_size + METADATA_SIZE;
+  void *new_block;
+
+  size_t buffer_size = block->size;
+  char *buffer[MMAP_THRESHOLD];
+  memcpy(buffer, PAYLOAD(block), buffer_size);
+
+  if (new_payload_size <= MMAP_THRESHOLD) {
+    if (memory_block_metas == NULL) {
+      preallocate_heap();
+    }
+    if (block->status == STATUS_MAPPED) {
+      os_free(ptr);
+    } else {
+      block->status = STATUS_FREE;
+      coalesce_current_block(block, block->next, new_payload_size);
+    }
+    new_block = find_best_available_space(memory_block_metas, new_payload_size);
+
+    if (new_block == NULL) {
+      new_block = (last_block->status == STATUS_FREE ? extend_last_block(new_payload_size) : append_new_block(new_payload_size));
+      memcpy(PAYLOAD(new_block), buffer, buffer_size);
+      os_free(ptr);
+    } else {
+      struct block_meta *temp_block = (struct block_meta *)new_block;
+      size_t new_size = check_block_for_splitting(temp_block, new_payload_size);
+      set_block_metadata(temp_block, new_size, STATUS_ALLOC, temp_block->prev, temp_block->next);
+      memcpy(PAYLOAD(new_block), buffer, new_payload_size);
+    }
+  } else {
+    new_block = os_malloc(new_payload_size);
+    set_block_metadata((struct block_meta*)new_block, new_payload_size, STATUS_MAPPED, NULL, NULL);
+    memcpy(PAYLOAD(new_block), buffer, MIN(buffer_size, new_payload_size));
+    os_free(ptr);
+  }
+  return PAYLOAD(new_block);
 }
